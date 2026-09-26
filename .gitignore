@@ -1,0 +1,15 @@
+# Local source material retained outside the published proof of concept
+/dns_oob_lab.py
+/Purple Team Training Report.md
+
+# Python-generated files and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor and operating-system metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
