@@ -98,15 +98,15 @@ class QueryResult:
 
     @property
     def ok(self) -> bool:
-        return self.status == "NOERROR" and bool(self.answers)
+        return self.status == "NOERROR" and any(value.strip() for value in self.answers)
 
 
 class RecursiveDNSClient:
     """Issue queries through one or more recursive resolvers.
 
     When multiple resolvers are supplied, transient failures such as timeout
-    and SERVFAIL move to the next resolver.  Authoritative NXDOMAIN and NODATA
-    results are final and are not retried elsewhere.
+    and SERVFAIL move to the next resolver.  NXDOMAIN and NODATA results are
+    final and are not retried elsewhere; their origin is not verified here.
     """
 
     def __init__(self, nameservers: Sequence[str] | None, timeout: float):
@@ -364,6 +364,33 @@ def phase_a(client: RecursiveDNSClient) -> PhaseResult:
     return result
 
 
+def parse_cymru_asns(value: str) -> tuple[str, ...]:
+    """Validate an origin TXT record's ASN field and IPv4 network prefix.
+
+    Multiple origin ASNs are valid. Country, registry, and allocation fields
+    are retained in the displayed answer but are not graded by this checkpoint.
+    """
+    fields = [field.strip() for field in value.split("|")]
+    if len(fields) != 5 or not re.fullmatch(r"[0-9]+(?:\s+[0-9]+)*", fields[0]):
+        return ()
+    asns = tuple(fields[0].split())
+    if any(len(asn) > 10 or not 0 < int(asn) <= 4294967295 for asn in asns):
+        return ()
+    if "/" not in fields[1]:
+        return ()
+    try:
+        ipaddress.IPv4Network(fields[1])
+    except ValueError:
+        return ()
+    return asns
+
+
+def valid_hash_metadata(value: str) -> bool:
+    """Accept a nonnegative integer epoch and an integer percentage, 0-100."""
+    match = re.fullmatch(r"[0-9]+\s+([0-9]{1,3})", value.strip())
+    return match is not None and int(match.group(1)) <= 100
+
+
 def phase_b(
     client: RecursiveDNSClient,
     lookup_ip: str,
@@ -376,43 +403,65 @@ def phase_b(
         "Team Cymru gives us predictable security data, separating DNS transport "
         "and parsing from the delegation and LLM uncertainty added in Phase C. "
         "It is a teaching bridge, not a dependency of the LLM chain.",
-        "An ASN TXT record plus either malware-hash data or an authoritative "
-        "negative result for an unknown hash.",
+        "A valid ASN/prefix TXT record plus either matching positive hash data "
+        "or paired NXDOMAIN responses received through the resolver.",
     )
 
     asn_result = client.query(ipv4_to_cymru_qname(lookup_ip), "TXT")
     print_result(f"B1 Team Cymru IP-to-ASN ({lookup_ip})", asn_result)
 
-    if asn_result.ok:
-        match = re.match(r"\s*(\d+)\s*\|", asn_result.answers[0])
-        if match:
-            print_result(
-                f"B2 Team Cymru ASN details (AS{match.group(1)})",
-                client.query(f"AS{match.group(1)}.asn.cymru.com", "TXT"),
-            )
+    parsed_asns = [parse_cymru_asns(value) for value in asn_result.answers]
+    asn_valid = asn_result.ok and all(parsed_asns)
+    if asn_valid:
+        # One detail lookup keeps the demonstration small even for multiple origins.
+        asn = parsed_asns[0][0]
+        print_result(
+            f"B2 Team Cymru ASN details (AS{asn}; first origin shown)",
+            client.query(f"AS{asn}.asn.cymru.com", "TXT"),
+        )
+    else:
+        print("  interpretation: no valid ASN/prefix response was received")
 
     hash_qname = hash_to_cymru_qname(file_hash)
     hash_a_result = client.query(hash_qname, "A")
     print_result("B3 Team Cymru malware-hash membership", hash_a_result)
     hash_txt_result = client.query(hash_qname, "TXT")
     print_result("B4 Team Cymru malware-hash metadata", hash_txt_result)
-    print("  note: NXDOMAIN for B3/B4 means the hash is absent from the public registry")
-
-    authoritative_states = {"NOERROR", "NXDOMAIN", "NODATA"}
-    hash_service_reached = (
-        hash_a_result.status in authoritative_states
-        and hash_txt_result.status in authoritative_states
+    hash_positive = (
+        hash_a_result.ok
+        and set(hash_a_result.answers) == {"127.0.0.2"}
+        and hash_txt_result.ok
+        and len(hash_txt_result.answers) == 1
+        and valid_hash_metadata(hash_txt_result.answers[0])
     )
-    observed = asn_result.ok and hash_service_reached
+    hash_negative = (
+        hash_a_result.status == hash_txt_result.status == "NXDOMAIN"
+        and not hash_a_result.answers
+        and not hash_txt_result.answers
+    )
+    if hash_positive:
+        hash_evidence = "Matching positive hash membership and formatted metadata received."
+    elif hash_negative:
+        hash_evidence = (
+            "Paired hash NXDOMAIN responses received through the resolver; "
+            "registry origin and hash absence are unverified (cache or policy may apply)."
+        )
+    else:
+        hash_evidence = (
+            "Hash lookup inconclusive: expected matching positive data or paired "
+            "NXDOMAIN; NODATA, malformed, or contradictory replies do not qualify."
+        )
+    print(f"  interpretation: {hash_evidence}")
+    observed = asn_valid and (hash_positive or hash_negative)
     result = PhaseResult(
         phase="B",
         capability="Caller input and structured application answers over DNS",
         outcome=PhaseOutcome.OBSERVED if observed else PhaseOutcome.NOT_OBSERVED,
         evidence=(
-            "Team Cymru returned structured ASN data and a conclusive hash lookup."
-            if observed
-            else "The ASN lookup or malware-hash service interaction was inconclusive."
-        ),
+            "Valid structured ASN/prefix data received. "
+            if asn_valid
+            else "No valid structured ASN/prefix data received. "
+        ) + hash_evidence,
     )
     print_phase_checkpoint(result)
     return result
@@ -427,13 +476,17 @@ def phase_c(
     print_phase_intro(
         "Can the resolver follow a dynamic NS referral, deliver a prompt to a "
         "selected public service, and relay its computed TXT answer?",
-        "Phases A and B established the transport and request/response model. "
-        "This phase adds dynamic delegation, a slow upstream dependency, and "
+        "Phases A and B investigated the transport and request/response model. "
+        "This phase investigates dynamic delegation, a slow upstream dependency, and "
         "non-deterministic output.",
-        "At least one synthetic prompt returns a TXT answer through an "
-        "nsrecord.net handoff and public DNS LLM gateway.",
+        "At least one handoff QNAME returns nonempty TXT content. This alone "
+        "does not verify delegation, answer relevance, or fresh computation.",
     )
     print("Synthetic prompts only: public DNS queries are plaintext, logged, and cacheable.")
+    print(
+        "Review the content for service errors and relevance; use resolver evidence "
+        "to verify delegation and caching. Fresh computation requires gateway evidence."
+    )
 
     gateways: list[tuple[str, str]] = []
     print("\nGateway discovery through the recursive resolver:")
@@ -453,65 +506,59 @@ def phase_c(
         print("No public DNS LLM gateway address could be resolved; skipping prompts.")
         result = PhaseResult(
             phase="C",
-            capability="Dynamic delegation to external computation",
+            capability="TXT response received for a handoff QNAME",
             outcome=PhaseOutcome.NOT_OBSERVED,
             evidence="No public DNS LLM gateway address was available through the resolver.",
         )
         print_phase_checkpoint(result)
         return result
 
-    work: list[tuple[str, str | None]] = []
-    for prompt in prompts:
-        try:
-            # Validate the prompt and full name before starting worker threads.
-            prompt_to_handoff_qname(prompt, gateways[0][1])
-            work.append((prompt, None))
-        except ValueError as exc:
-            work.append((prompt, str(exc)))
-
     def query_prompt(prompt: str):
-        attempts: list[tuple[str, QueryResult]] = []
+        attempts: list[tuple[str, QueryResult | None, str]] = []
         for hostname, address in gateways:
-            qname = prompt_to_handoff_qname(prompt, address)
+            try:
+                # The encoded address changes the length budget for each gateway.
+                qname = prompt_to_handoff_qname(prompt, address)
+            except ValueError as exc:
+                attempts.append((hostname, None, str(exc)))
+                continue
             result = client.query(qname, "TXT")
-            attempts.append((hostname, result))
+            attempts.append((hostname, result, ""))
             if result.ok:
-                return hostname, result, attempts
-        return gateways[-1][0], attempts[-1][1], attempts
+                break
+        return attempts
 
     # Keep concurrency intentionally modest: this is a public hobby/research
     # endpoint, not capacity owned by the lab.
-    successful_prompts = 0
+    responding_prompts = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [
-            executor.submit(query_prompt, prompt) if error is None else None
-            for prompt, error in work
+            (prompt, executor.submit(query_prompt, prompt)) for prompt in prompts
         ]
 
-        for index, (prompt, error) in enumerate(work):
+        for prompt, future in futures:
             print(f"\nPrompt: {prompt}")
-            if error:
-                print(f"  encoding error: {error}")
-                continue
-            hostname, result, attempts = futures[index].result()
-            if len(attempts) > 1:
-                failed = ", ".join(
-                    f"{name}={attempt.status}" for name, attempt in attempts[:-1]
-                )
-                print(f"  gateway fallback: {failed}")
-            print_result(f"C2 delegated LLM through {hostname}", result)
-            if result.ok:
-                successful_prompts += 1
+            attempts = future.result()
+            for hostname, result, error in attempts:
+                if result is None:
+                    print(f"  gateway {hostname}: encoding error: {error}; no query sent")
+                else:
+                    print_result(f"C2 handoff TXT via {hostname}", result)
+                    if result.status == "NOERROR" and not result.ok:
+                        print("  interpretation: empty or whitespace-only TXT content")
+            if any(result is not None and result.ok for _, result, _ in attempts):
+                responding_prompts += 1
 
-    observed = successful_prompts > 0
+    observed = responding_prompts > 0
     result = PhaseResult(
         phase="C",
-        capability="Dynamic delegation to external computation",
+        capability="TXT response received for a handoff QNAME",
         outcome=PhaseOutcome.OBSERVED if observed else PhaseOutcome.NOT_OBSERVED,
         evidence=(
-            f"{successful_prompts} delegated prompt(s) returned TXT answers."
+            f"{responding_prompts} handoff prompt(s) returned nonempty TXT content; "
+            "delegation, relevance, and fresh computation remain unverified."
             if observed
-            else "No delegated prompt returned a usable TXT answer."
+            else "No handoff prompt returned nonempty TXT content."
         ),
     )
     print_phase_checkpoint(result)
@@ -608,7 +655,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("LLM phase skipped by request.")
         phase_c_result = PhaseResult(
             phase="C",
-            capability="Dynamic delegation to external computation",
+            capability="TXT response received for a handoff QNAME",
             outcome=PhaseOutcome.SKIPPED,
             evidence="The --skip-llm option intentionally omitted this checkpoint.",
         )
