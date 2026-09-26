@@ -6,14 +6,16 @@ only sends ordinary DNS queries to its configured recursive resolver.  The
 dynamic work happens at public authoritative DNS services reached through
 normal delegation.
 
-Phases:
-  A. Resolver/recursion checks and sslip.io input-to-A-record mapping.
-  B. Deterministic TXT query APIs from Team Cymru:
+Capability ladder:
+  A. Prove the approved resolver can reach public authoritative DNS.
+  B. Prove DNS can carry caller-controlled input and structured output with
+     deterministic Team Cymru services:
        * IP address -> origin ASN and prefix
        * file hash -> malware-registry status
-  C. Prompt -> nsrecord.net dynamic NS handoff -> public DNS LLM gateway ->
-     TXT response.  The gateway hosts are resolved at runtime, so no account,
-     domain, zone configuration, or fixed gateway IP is required.
+  C. Combine those capabilities: prompt -> nsrecord.net dynamic NS handoff ->
+     public DNS LLM gateway -> TXT response.  The gateway hosts are resolved at
+     runtime, so no account, domain, zone configuration, or fixed gateway IP is
+     required.
 
 There is intentionally no arbitrary URL-fetch phase.  The former
 ``v1.txtify.it`` DNS interface is not available, and no trustworthy public
@@ -47,6 +49,7 @@ import sys
 import time
 import unicodedata
 from dataclasses import dataclass
+from enum import Enum
 from typing import Iterable, Sequence
 
 import dns.exception
@@ -67,6 +70,20 @@ DEFAULT_PROMPTS = (
     "name three dns record types",
     "explain dns recursion in one sentence",
 )
+
+
+class PhaseOutcome(Enum):
+    OBSERVED = "OBSERVED"
+    NOT_OBSERVED = "NOT OBSERVED"
+    SKIPPED = "SKIPPED"
+
+
+@dataclass(frozen=True)
+class PhaseResult:
+    phase: str
+    capability: str
+    outcome: PhaseOutcome
+    evidence: str
 
 
 @dataclass(frozen=True)
@@ -209,6 +226,31 @@ def print_result(label: str, result: QueryResult) -> None:
         print(f"  detail: {result.error}")
 
 
+def print_phase_intro(question: str, why: str, success: str) -> None:
+    print(f"Question we are answering: {question}")
+    print(f"Why this checkpoint comes now: {why}")
+    print(f"What success should look like: {success}")
+
+
+def print_phase_checkpoint(result: PhaseResult) -> None:
+    print(f"\nCheckpoint {result.phase}: {result.outcome.value}")
+    print(f"  Capability: {result.capability}")
+    print(f"  Evidence: {result.evidence}")
+
+
+def print_ladder_summary(results: Sequence[PhaseResult]) -> None:
+    print("\n=== Capability ladder summary ===")
+    for result in results:
+        print(f"Phase {result.phase}: {result.outcome.value} - {result.capability}")
+        print(f"  {result.evidence}")
+
+    if any(result.outcome is PhaseOutcome.NOT_OBSERVED for result in results):
+        print(
+            "\nOne or more checkpoints were not observed. Later results are still "
+            "useful evidence, but interpret them with the earlier gap in mind."
+        )
+
+
 def ipv4_to_cymru_qname(address: str) -> str:
     ip = ipaddress.ip_address(address)
     if ip.version != 4:
@@ -277,9 +319,18 @@ def prompt_to_handoff_qname(prompt: str, gateway_ip: str) -> str:
     return qname
 
 
-def phase_a(client: RecursiveDNSClient) -> None:
-    print("\n=== Phase A: resolver and recursive reachability ===")
-    print_result("A1 known public name", client.query("example.com", "A"))
+def phase_a(client: RecursiveDNSClient) -> PhaseResult:
+    print("\n=== Phase A: prove the recursive path ===")
+    print_phase_intro(
+        "Can the approved resolver reach public authoritative DNS?",
+        "Before interpreting an application response, we need to prove the "
+        "underlying recursive path and see which system reaches the authority.",
+        "Public A answers, an sslip.io generated answer, and a TXT value showing "
+        "the resolver's outward-facing address.",
+    )
+
+    known_result = client.query("example.com", "A")
+    print_result("A1 known public name", known_result)
 
     negative_name = f"nx-{secrets.token_hex(4)}.invalid"
     print_result(
@@ -287,20 +338,47 @@ def phase_a(client: RecursiveDNSClient) -> None:
         client.query(negative_name, "A"),
     )
 
-    print_result(
-        "A3 sslip.io encoded address",
-        client.query("198-51-100-24.sslip.io", "A"),
-    )
+    sslip_result = client.query("198-51-100-24.sslip.io", "A")
+    print_result("A3 sslip.io encoded address", sslip_result)
 
-    print_result(
-        "A4 authoritative view of recursive egress",
-        client.query("ip.nip.io", "TXT"),
-    )
+    egress_result = client.query("ip.nip.io", "TXT")
+    print_result("A4 authoritative view of recursive egress", egress_result)
     print("  note: A4 normally reports the recursive resolver's source address, not the client")
 
+    observed = (
+        known_result.ok
+        and "198.51.100.24" in sslip_result.answers
+        and egress_result.ok
+    )
+    result = PhaseResult(
+        phase="A",
+        capability="Recursive access to public authoritative DNS",
+        outcome=PhaseOutcome.OBSERVED if observed else PhaseOutcome.NOT_OBSERVED,
+        evidence=(
+            "The resolver returned public, dynamically generated A/TXT answers."
+            if observed
+            else "One or more public-authority checks did not return the expected answer."
+        ),
+    )
+    print_phase_checkpoint(result)
+    return result
 
-def phase_b(client: RecursiveDNSClient, lookup_ip: str, file_hash: str) -> None:
-    print("\n=== Phase B: deterministic public TXT query services ===")
+
+def phase_b(
+    client: RecursiveDNSClient,
+    lookup_ip: str,
+    file_hash: str,
+) -> PhaseResult:
+    print("\n=== Phase B: prove DNS can behave like an application query API ===")
+    print_phase_intro(
+        "Can a QNAME carry caller-controlled input and can A/TXT records return "
+        "structured application data?",
+        "Team Cymru gives us predictable security data, separating DNS transport "
+        "and parsing from the delegation and LLM uncertainty added in Phase C. "
+        "It is a teaching bridge, not a dependency of the LLM chain.",
+        "An ASN TXT record plus either malware-hash data or an authoritative "
+        "negative result for an unknown hash.",
+    )
 
     asn_result = client.query(ipv4_to_cymru_qname(lookup_ip), "TXT")
     print_result(f"B1 Team Cymru IP-to-ASN ({lookup_ip})", asn_result)
@@ -314,23 +392,47 @@ def phase_b(client: RecursiveDNSClient, lookup_ip: str, file_hash: str) -> None:
             )
 
     hash_qname = hash_to_cymru_qname(file_hash)
-    print_result(
-        "B3 Team Cymru malware-hash membership",
-        client.query(hash_qname, "A"),
-    )
-    print_result(
-        "B4 Team Cymru malware-hash metadata",
-        client.query(hash_qname, "TXT"),
-    )
+    hash_a_result = client.query(hash_qname, "A")
+    print_result("B3 Team Cymru malware-hash membership", hash_a_result)
+    hash_txt_result = client.query(hash_qname, "TXT")
+    print_result("B4 Team Cymru malware-hash metadata", hash_txt_result)
     print("  note: NXDOMAIN for B3/B4 means the hash is absent from the public registry")
+
+    authoritative_states = {"NOERROR", "NXDOMAIN", "NODATA"}
+    hash_service_reached = (
+        hash_a_result.status in authoritative_states
+        and hash_txt_result.status in authoritative_states
+    )
+    observed = asn_result.ok and hash_service_reached
+    result = PhaseResult(
+        phase="B",
+        capability="Caller input and structured application answers over DNS",
+        outcome=PhaseOutcome.OBSERVED if observed else PhaseOutcome.NOT_OBSERVED,
+        evidence=(
+            "Team Cymru returned structured ASN data and a conclusive hash lookup."
+            if observed
+            else "The ASN lookup or malware-hash service interaction was inconclusive."
+        ),
+    )
+    print_phase_checkpoint(result)
+    return result
 
 
 def phase_c(
     client: RecursiveDNSClient,
     prompts: Iterable[str],
     workers: int,
-) -> None:
-    print("\n=== Phase C: dynamic NS handoff to public DNS LLM gateways ===")
+) -> PhaseResult:
+    print("\n=== Phase C: combine delegation with external computation ===")
+    print_phase_intro(
+        "Can the resolver follow a dynamic NS referral, deliver a prompt to a "
+        "selected public service, and relay its computed TXT answer?",
+        "Phases A and B established the transport and request/response model. "
+        "This phase adds dynamic delegation, a slow upstream dependency, and "
+        "non-deterministic output.",
+        "At least one synthetic prompt returns a TXT answer through an "
+        "nsrecord.net handoff and public DNS LLM gateway.",
+    )
     print("Synthetic prompts only: public DNS queries are plaintext, logged, and cacheable.")
 
     gateways: list[tuple[str, str]] = []
@@ -349,7 +451,14 @@ def phase_c(
 
     if not gateways:
         print("No public DNS LLM gateway address could be resolved; skipping prompts.")
-        return
+        result = PhaseResult(
+            phase="C",
+            capability="Dynamic delegation to external computation",
+            outcome=PhaseOutcome.NOT_OBSERVED,
+            evidence="No public DNS LLM gateway address was available through the resolver.",
+        )
+        print_phase_checkpoint(result)
+        return result
 
     work: list[tuple[str, str | None]] = []
     for prompt in prompts:
@@ -372,6 +481,7 @@ def phase_c(
 
     # Keep concurrency intentionally modest: this is a public hobby/research
     # endpoint, not capacity owned by the lab.
+    successful_prompts = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [
             executor.submit(query_prompt, prompt) if error is None else None
@@ -390,6 +500,22 @@ def phase_c(
                 )
                 print(f"  gateway fallback: {failed}")
             print_result(f"C2 delegated LLM through {hostname}", result)
+            if result.ok:
+                successful_prompts += 1
+
+    observed = successful_prompts > 0
+    result = PhaseResult(
+        phase="C",
+        capability="Dynamic delegation to external computation",
+        outcome=PhaseOutcome.OBSERVED if observed else PhaseOutcome.NOT_OBSERVED,
+        evidence=(
+            f"{successful_prompts} delegated prompt(s) returned TXT answers."
+            if observed
+            else "No delegated prompt returned a usable TXT answer."
+        ),
+    )
+    print_phase_checkpoint(result)
+    return result
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -463,14 +589,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"Resolvers: {', '.join(client.nameservers)}")
     print(f"Per-resolver lifetime: {client.timeout:g}s")
     print("No direct HTTP requests are made by this client.")
+    print(
+        "\nCapability ladder: A proves the path; B proves structured DNS "
+        "request/response; C combines both with dynamic delegation and computation."
+    )
+    print(
+        "Every phase still runs after an inconclusive checkpoint so the output "
+        "can help locate the broken link."
+    )
 
-    phase_a(client)
-    phase_b(client, args.lookup_ip, args.file_hash)
+    phase_results = [
+        phase_a(client),
+        phase_b(client, args.lookup_ip, args.file_hash),
+    ]
 
     if args.skip_llm:
-        print("\nLLM phase skipped by request.")
+        print("\n=== Phase C: combine delegation with external computation ===")
+        print("LLM phase skipped by request.")
+        phase_c_result = PhaseResult(
+            phase="C",
+            capability="Dynamic delegation to external computation",
+            outcome=PhaseOutcome.SKIPPED,
+            evidence="The --skip-llm option intentionally omitted this checkpoint.",
+        )
+        print_phase_checkpoint(phase_c_result)
     else:
-        phase_c(client, args.prompt or DEFAULT_PROMPTS, args.workers)
+        phase_c_result = phase_c(
+            client,
+            args.prompt or DEFAULT_PROMPTS,
+            args.workers,
+        )
+
+    phase_results.append(phase_c_result)
+    print_ladder_summary(phase_results)
 
     return 0
 

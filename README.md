@@ -16,6 +16,23 @@ authoritative server.
 
 The lab implementation is [`dns_oob_lab_v2.py`](./dns_oob_lab_v2.py).
 
+## Mission brief
+
+Treat the exercise as a capability ladder, not as three unrelated demos. Each
+phase proves one prerequisite before adding another moving part. The endpoint
+always sends ordinary DNS queries to the approved recursive resolver; the
+interesting behavior happens beyond that resolver.
+
+| Phase | Question | Why it exists | Expected evidence | If it is not observed | What it unlocks |
+|---|---|---|---|---|---|
+| **A — Recursive path** | Can the approved resolver reach public authoritative DNS? | Establish the network path before testing application behavior. | Public `A` answers, a generated sslip.io answer, and a resolver-egress `TXT` answer. | Suspect the resolver address, client-to-resolver access, recursion policy, or public authoritative reachability. | Confidence that later queries can leave the local DNS boundary through normal recursion. |
+| **B — Structured exchange** | Can a QNAME carry caller-controlled input and can DNS records return structured application output? | Separate DNS transport and parsing from the slower, less predictable LLM chain. | Team Cymru returns ASN data and a conclusive malware-hash response, including a valid authoritative negative. | If A worked, suspect record-type filtering, service availability, or parsing. | A known-good model for input-in-name and data-in-answer behavior. |
+| **C — Delegated computation** | Can the resolver combine that exchange with a dynamic delegation and external computation? | Add the final capabilities: generated `NS` handoff, a selected gateway, and a computed answer. | At least one synthetic prompt produces a `TXT` answer through the delegated gateway. | If A and B worked, inspect delegation policy, glue handling, gateway reachability, timeout, and public-service availability. | The complete security-relevant chain and its strongest detection opportunities. |
+
+An inconclusive checkpoint does not stop the script. Later phases still run so
+you can collect diagnostic evidence, although their results may be harder to
+interpret when an earlier prerequisite was not observed.
+
 ## What you will learn
 
 By the end of the exercise, you should be able to explain and observe:
@@ -77,22 +94,9 @@ python -m pip install dnspython
 
 ## Quick start
 
-### 1. Review the available options
+### Recommended guided run
 
-```powershell
-python .\dns_oob_lab_v2.py --help
-```
-
-### 2. Use the operating system's configured resolver
-
-```powershell
-python .\dns_oob_lab_v2.py
-```
-
-This is normally the right starting point. In a managed lab, the operating
-system should already point at the internal resolver.
-
-### 3. Select the lab resolver explicitly
+Start with one complete run through the approved lab resolver:
 
 ```powershell
 python .\dns_oob_lab_v2.py --resolver 10.214.0.2
@@ -101,18 +105,35 @@ python .\dns_oob_lab_v2.py --resolver 10.214.0.2
 Replace `10.214.0.2` if your exercise provides a different resolver address.
 Do not substitute a public resolver merely to make the test pass: if direct
 DNS egress is supposed to be blocked, using the internal resolver is the point
-of the exercise.
+of the exercise. Read the three introductions as the script runs, inspect each
+checkpoint, and finish with the capability-ladder summary. A result of `NOT
+OBSERVED` is diagnostic evidence, not a reason to abandon the run.
 
-### 4. Run only the deterministic phases
+If your lab intentionally uses the operating system's configured resolver,
+omit `--resolver`:
+
+```powershell
+python .\dns_oob_lab_v2.py
+```
+
+### Optional run variants
+
+Review all available options:
+
+```powershell
+python .\dns_oob_lab_v2.py --help
+```
+
+Run only the deterministic checkpoints:
 
 ```powershell
 python .\dns_oob_lab_v2.py --resolver 10.214.0.2 --skip-llm
 ```
 
 This runs the resolver, wildcard-DNS, ASN, and malware-hash checks without
-contacting a public DNS-backed LLM.
+contacting a public DNS-backed LLM. Phase C appears as `SKIPPED`, not failed.
 
-### 5. Supply a single synthetic prompt
+Supply a single synthetic prompt:
 
 ```powershell
 python .\dns_oob_lab_v2.py `
@@ -133,7 +154,7 @@ python .\dns_oob_lab_v2.py `
 Concurrency is intentionally limited to four workers. These are public
 research and hobby services, so please be a considerate guest.
 
-### 6. Change the deterministic lookup inputs
+Change the deterministic lookup inputs:
 
 ```powershell
 python .\dns_oob_lab_v2.py `
@@ -146,7 +167,7 @@ python .\dns_oob_lab_v2.py `
 The default hash is a public example from Team Cymru's documentation. No file
 or malware sample is downloaded.
 
-### 7. Test resolver fallback outside a restricted lab
+Test resolver fallback outside a restricted lab:
 
 Multiple `--resolver` arguments are tried in order for transient failures:
 
@@ -160,38 +181,55 @@ This is useful on an ordinary test network. It is usually inappropriate inside
 the restricted exercise because the expected route is through the designated
 internal resolver.
 
-## What each phase demonstrates
+## The three checkpoint investigations
 
-### Phase A: resolver and recursive reachability
+### Phase A — Prove the recursive path
 
-Phase A starts with basic controls:
+**Hypothesis:** The workstation can ask its approved recursive resolver, and
+that resolver can reach public authoritative DNS on the workstation's behalf.
 
-1. `example.com A` confirms that the selected resolver answers a known public
-   name.
-2. A random name under the reserved `.invalid` top-level domain confirms that
-   negative responses are handled correctly.
-3. `198-51-100-24.sslip.io A` returns `198.51.100.24`. The address is encoded
-   in the name, and the authoritative service generates the answer.
-4. `ip.nip.io TXT` shows the source address seen by the authoritative server.
-   Through recursion, this is normally an address belonging to the recursive
-   resolver—not the analyst workstation.
+**Action:** The script requests four controls:
 
-That final result is particularly useful in a purple-team exercise: it makes
-the intermediary role of the recursive resolver visible.
+1. `example.com A` checks a familiar public name.
+2. A random name under the reserved `.invalid` top-level domain checks normal
+   negative-response handling.
+3. `198-51-100-24.sslip.io A` encodes an address in the QNAME; sslip.io
+   dynamically returns `198.51.100.24`.
+4. `ip.nip.io TXT` asks the authority which source address it sees.
 
-### Phase B: deterministic data services over DNS
+**Expected observation:** The positive queries return their expected `A` or
+`TXT` records, while the `.invalid` control returns `NXDOMAIN`. The address in
+the `ip.nip.io` answer normally belongs to a recursive-resolver node rather
+than the analyst workstation.
 
-The [Team Cymru IP-to-ASN service](https://www.team-cymru.com/ip-asn-mapping)
-maps an input address to routing information. For `8.8.8.8`, the QNAME is:
+**Why this matters:** It proves both ordinary recursion and dynamic
+authoritative behavior before application-style DNS is introduced. It also
+makes the resolver's intermediary role visible.
+
+**What it unlocks next:** With the path established, Phase B can test whether
+meaningful input and structured output survive that path.
+
+**Pause and explain:** Which system contacted the public authority? Why is the
+`.invalid` result evidence of working DNS rather than evidence of failure? If
+`example.com` works but `ip.nip.io TXT` does not, what policy or record-type
+difference would you investigate?
+
+### Phase B — Prove a structured DNS application exchange
+
+**Hypothesis:** A QNAME can carry caller-selected security data, and ordinary
+DNS records can return structured application results.
+
+**Action:** The [Team Cymru IP-to-ASN service](https://www.team-cymru.com/ip-asn-mapping)
+maps a public IPv4 address to routing context. For the default `8.8.8.8` input,
+the QNAME is:
 
 ```text
 8.8.8.8.origin.asn.cymru.com TXT
 ```
 
-The octets are reversed in the general IPv4 case, similar to other DNS-based
-lookup lists. A response includes the origin ASN, BGP prefix, registry country,
-registry name, and allocation date. The script then queries the corresponding
-ASN description.
+The octets are reversed in the general IPv4 case, similar to a DNS blocklist.
+The answer contains the origin ASN and BGP prefix; the script then requests the
+ASN description, including registry and allocation information.
 
 The [Team Cymru Malware Hash Registry](https://hash.cymru.com/docs_dns) accepts
 MD5, SHA-1, and SHA-256 indicators:
@@ -201,18 +239,47 @@ MD5, SHA-1, and SHA-256 indicators:
 8a62d103168974fba9c61edab336038c.hash.cymru.com TXT
 ```
 
-A recognized hash returns `127.0.0.2` for the `A` query. The `TXT` answer adds
+A recognized hash returns `127.0.0.2` for the `A` query. Its `TXT` answer adds
 a last-seen timestamp and antivirus detection percentage. An absent indicator
-normally returns `NXDOMAIN`—that is a valid negative result, not necessarily a
-network failure.
+normally returns an authoritative `NXDOMAIN`; the lab treats that as a valid
+service interaction rather than a transport failure.
 
-This phase is handy because it is predictable, security-relevant, and does not
-depend on generative output.
+> **Why Team Cymru?** IP-to-ASN enrichment helps an analyst identify the
+> network owner, advertised prefix, and routing context of suspicious
+> infrastructure. MHR gives a quick known-malware-hash check without
+> downloading the sample. In this lab, their additional job is to demonstrate
+> that a QNAME can carry input and `A`/`TXT` records can carry structured
+> application data. The services are predictable enough to isolate transport
+> and parsing problems from Phase C's latency and availability variables.
+> **Neither service participates in the Phase C LLM request path.** An absent
+> hash is also not proof that a file is safe; it only means this public registry
+> did not return a record for it.
 
-### Phase C: dynamic delegation to an LLM-over-DNS gateway
+**Expected observation:** The ASN query returns a structured `TXT` answer and
+the hash service returns either known-hash data or a conclusive authoritative
+negative response. A successful ASN response is required for the script to
+mark Phase B `OBSERVED`.
 
-This phase reproduces the interesting two-service chain from the exercise
-without registering anything.
+**Why this matters:** Phase B is the controlled bridge between “DNS works” and
+“DNS can act as an application transport.” It demonstrates the request/response
+shape without relying on generated text.
+
+**What it unlocks next:** Phase C can reuse the same input-in-QNAME and
+output-in-TXT pattern while adding dynamic delegation and external computation.
+
+**Pause and explain:** Where is the lookup input in each QNAME? Which answer
+fields would help enrich a suspicious IP or hash? Why must `NXDOMAIN` be read
+in service context? Why would an ASN success be a better transport checkpoint
+than relying only on a hash that may legitimately be absent?
+
+### Phase C — Combine delegation with external computation
+
+**Hypothesis:** The resolver can follow a dynamically generated delegation,
+send caller-selected input to the delegated server, and relay a computed `TXT`
+answer.
+
+**Action:** The script builds a two-service chain without requiring an account,
+registered domain, or custom authoritative server.
 
 Suppose `ch.at` currently resolves to `34.28.5.90`. The script changes this:
 
@@ -248,6 +315,24 @@ also makes the lab traffic easy to recognize in logs.
 If the first gateway fails, the script tries the second gateway. This improves
 the demonstration, but public services can still be unavailable, rate-limited,
 or changed without notice.
+
+**Expected observation:** At least one synthetic prompt returns a `TXT` answer
+after the `nsrecord.net` referral. It is normal for this phase to take much
+longer than a conventional DNS lookup.
+
+**Why this matters:** This is where the earlier capabilities become a security
+boundary question. The endpoint still contacts only its approved resolver, but
+normal recursion selects an external server and carries application content in
+both directions.
+
+**What it unlocks next:** The full chain gives defenders high-confidence
+handoff indicators and several events to correlate across endpoint, resolver,
+and perimeter telemetry.
+
+**Pause and explain:** Which service performs the handoff and which performs
+the computation? Why is glue needed? What would be visible on the endpoint,
+the recursive resolver, and the resolver's network edge? How might caching
+change a repeated observation?
 
 ## DNS concepts in plain language
 
@@ -335,6 +420,18 @@ by generating large volumes of random prompts against a public hobby service.
 A firewall watching only the analyst workstation may see nothing except DNS to
 the approved internal resolver. Detection therefore works best by correlating
 endpoint and recursive-resolver telemetry.
+
+### Detection follows the capability ladder
+
+| Phase | Defensive lesson | What to collect |
+|---|---|---|
+| **A — Recursive path** | Establish normal recursive-resolution telemetry before deciding what is unusual. This traffic is mostly baseline, not an alert by itself. | Client, resolver, QNAME, type, response code, latency, cache status, and resolver egress destination. |
+| **B — Structured exchange** | Legitimate DNS APIs can resemble command-and-control or tunneling patterns. Team Cymru is an intentional false-positive example: unusual names and `TXT` data can serve a valid security workflow. | Originating process, known service suffix, input shape, response meaning, cadence, and analyst/tool context. |
+| **C — Delegated computation** | A generated handoff suffix, prompt-like QNAME, dynamic glue, new authoritative destination, and slow/large `TXT` response form a much stronger signal together. | Correlate the endpoint query, resolver referral, encoded destination, resolver egress, gateway lookup, latency, and final answer. |
+
+The progression matters: Phase A gives you the baseline, Phase B teaches why a
+single unusual DNS feature can produce false positives, and Phase C supplies
+multiple linked indicators suitable for a higher-confidence analytic.
 
 ### High-confidence indicators for this lab
 
@@ -445,6 +542,18 @@ Use the lab as a controlled test case:
 - [ ] Record false positives and tune by domain, process, and query structure.
 
 ## Troubleshooting
+
+### Read failures as a ladder
+
+| Result | Most useful interpretation |
+|---|---|
+| **A is not observed** | Start with the configured resolver, UDP/TCP 53 reachability, recursion policy, or access to public authoritative DNS. Results from later phases may be difficult to interpret until this path works. |
+| **A is observed, B is not** | The basic recursive path works. Investigate `TXT` or `A` record filtering, Team Cymru reachability, authoritative negative handling, or response parsing. |
+| **A and B are observed, C is not** | Basic recursion and structured DNS exchange work. Focus on the `nsrecord.net` delegation, glue and referral policy, selected gateway, timeout, rate limiting, or public-service availability. |
+| **C is skipped** | `--skip-llm` intentionally omitted the checkpoint; this is not a failed capability test. |
+
+The script continues after `NOT OBSERVED` so one run can capture evidence from
+all checkpoints. Always interpret a later result alongside the earlier ones.
 
 ### Everything times out
 
