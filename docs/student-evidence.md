@@ -5,6 +5,12 @@ Use this alongside the [lab README](../README.md). The transcript below is
 live run. Students without resolver access can analyze it offline and mark the
 resolver-side findings in their worksheet as **illustrative only**.
 
+Before collecting evidence, read
+[what the handoff changes](../README.md#what-the-handoff-changes). At the center
+of the exercise is a testable sequence: the authority returns a referral, then
+the resolver sends the original question to the selected gateway. Identify both
+events rather than treating the word "handoff" as proof that delivery occurred.
+
 ## Collect evidence for your own run
 
 1. Record the run time and time zone, approved resolver address, command, and

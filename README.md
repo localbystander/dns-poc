@@ -65,16 +65,21 @@ flowchart LR
 
     P --> S[sslip.io / nip.io]
     P --> C[Team Cymru DNS APIs]
-    P --> N[nsrecord.net handoff zone]
+    P --> N[nsrecord.net dynamic delegation service]
 
     N -->|NS referral plus glue| R
-    R -->|Original prompt QNAME| G[ch.at or llm.pieter.com DNS gateway]
-    G -->|LLM answer in TXT| R
+    R -->|Original QNAME and TXT question| G[ch.at or llm.pieter.com DNS gateway]
+    G -->|TXT response| R
     R -->|DNS response| A
 ```
 
 The important detail is that the workstation talks only to its configured
 recursive resolver. The resolver performs the public DNS traversal.
+
+**The key link is DNS delegation:** `handoff.nsrecord.net` tells the resolver
+which DNS server should answer the prompt namespace. The resolver then asks
+that server for the TXT answer. See
+[what the handoff changes](#what-the-handoff-changes) for the service's role.
 
 ## Requirements
 
@@ -363,6 +368,67 @@ The fixed `lab` label is not decoration: the hosted handoff service delegates
 queries that contain at least two labels before the embedded IP address. It
 also makes the lab traffic easy to recognize in logs.
 
+#### What the handoff changes
+
+**Handoff → delegate DNS authority → resolver asks the selected gateway.**
+The responsibility being handed off is **who answers for a part of the DNS
+namespace**. The service generates the referral; the recursive resolver does
+the subsequent querying.
+
+Read the constructed name as three inputs to that process:
+
+| Part | Role |
+|---|---|
+| `what-is-the-capital-of-france.lab` | The prompt labels and the extra label that activates the hosted delegation behavior |
+| `34-28-5-90` | The chosen gateway's address, encoded in the name |
+| `handoff.nsrecord.net` | The service namespace where dynamic delegation is enabled |
+
+For the hosted service, zero labels before the address give ordinary IP-echo
+behavior. With one label, A/AAAA still return the address; an explicit NS query
+can request the delegation information. With two or more labels, the service
+returns a referral for any query type, including the lab's TXT question.
+These are the [provider's documented rules](https://nsrecord.net/).
+
+The referral supplies an **NS target hostname** and its **address record**.
+An NS record contains a name, not a bare IP. The associated address information
+lets the resolver locate the next DNS server. The prompt stays in the original
+QNAME when the resolver asks that server for TXT data.
+
+```mermaid
+sequenceDiagram
+    participant W as Workstation
+    participant R as Recursive resolver
+    participant H as Handoff authority
+    participant G as Selected DNS gateway
+    W->>R: Original QNAME, type TXT
+    R->>H: Resolve the handoff name
+    H-->>R: Referral: NS target plus address/glue
+    Note over R,H: H tells R which DNS server to ask next
+    R->>G: Original QNAME, type TXT
+    G-->>R: TXT response
+    R-->>W: TXT response
+```
+
+This diagram assumes a fresh exchange with a reachable gateway; initial DNS
+discovery and cache shortcuts are omitted. The handoff service supplies DNS
+referral data. It does not forward the prompt to an AI API or relay the
+gateway's answer. Those roles belong to the gateway and resolver respectively.
+
+**Why it matters here:** Phase A's IP-echo service returns an address as data.
+Returning an A record alone does not cause a resolver to send a TXT question to
+that address. Phase C needs a delegation that directs the resolver's next DNS
+exchange. The hosted handoff service supplies that delegation without students
+registering a domain or configuring their own zone. It connects the approved
+recursive path to the selected DNS application server.
+
+The destination must already run a reachable DNS service and accept TXT
+questions for the generated names. Encoding a web server's IP cannot turn an
+ordinary HTTP API into a DNS gateway. A service with its own suitable public
+delegation may not need this extra handoff; it is the mechanism used by this
+particular construction.
+
+#### Interpret the response
+
 If the first gateway fails, the script tries the second gateway. This improves
 the demonstration, but public services can still be unavailable, rate-limited,
 or changed without notice.
@@ -393,10 +459,11 @@ both directions.
 handoff indicators and several events to correlate across endpoint, resolver,
 and perimeter telemetry.
 
-**Pause and explain:** Which service performs the handoff and which performs
-the computation? Why is glue needed? What would be visible on the endpoint,
-the recursive resolver, and the resolver's network edge? How might caching
-change a repeated observation?
+**Pause and explain:** Who sends the query after the referral: the handoff
+authority or the recursive resolver? What does the NS record identify, and
+where does its IP address come from? Why would an A record alone be insufficient?
+Which service handles the application request? What is visible at each capture
+point, and how might caching change a repeated observation?
 
 ## DNS concepts in plain language
 
@@ -427,13 +494,28 @@ and many security products use it legitimately.
 
 ### Delegation, referrals, and glue
 
-An `NS` delegation says, roughly, “ask this other server about the child zone.”
-The response is a **referral**, not the final application answer.
+| Concept | Plain-language meaning | Where to look in this exercise |
+|---|---|---|
+| **Zone / zone cut** | A zone is an administered portion of the DNS namespace; a delegation marks a boundary to a child zone. | The handoff response identifies a delegated subtree. |
+| **Delegation** | The parent identifies the DNS servers responsible for that child zone. | NS records name the next server; they do not contain the application answer. |
+| **Referral** | A response directing a resolver toward those servers. | NS records appear in the Authority section rather than as the final TXT answer. |
+| **Glue / address information** | A/AAAA records supply nameserver addresses, helping the resolver reach the next server. Glue is particularly necessary when resolving the server's name would itself require reaching that child zone. | Inspect the Additional section and compare its address with subsequent resolver egress. |
+| **Recursive versus iterative resolution** | The workstation requests a complete answer; the resolver follows referrals to obtain it. | The resolver, rather than the workstation or handoff authority, contacts the gateway. |
 
-The resolver also needs the delegated server's address. A **glue record** is an
-address included with the referral so the resolver can reach the next server
-without getting stuck in a circular lookup. `nsrecord.net` generates both the
-referral and glue from the IP encoded in the query name.
+These concepts are part of ordinary DNS resolution; see
+[RFC 1034](https://www.rfc-editor.org/rfc/rfc1034) and the
+[referral/glue requirements in RFC 9471](https://www.rfc-editor.org/rfc/rfc9471).
+
+Glue supplies routing information for DNS resolution, not permission to contact
+any address. Resolvers still apply their referral, address-acceptance, cache,
+and network policies. A referral can therefore be observed even when no gateway
+exchange follows. Inspect both events using the
+[evidence worksheet](./docs/student-evidence.md).
+
+An A answer maps a name to an address; a CNAME aliases one name to another.
+An NS delegation selects who answers for a child zone. Here, the selected
+gateway receives the original prompt QNAME: the handoff is neither an HTTP
+redirect nor a CNAME rewrite of the prompt.
 
 ### QNAMEs, labels, and limits
 
@@ -673,6 +755,8 @@ These checks use simulated DNS responses and make no live DNS or gateway request
 - [Team Cymru Malware Hash Registry DNS API](https://hash.cymru.com/docs_dns)
 - [LLM-over-DNS by Pieter](https://llm.pieter.com/)
 - [DNSChat](https://www.conhecendotudo.com.br/dnschat/)
+- [RFC 1034: Domain Names—Concepts and Facilities](https://www.rfc-editor.org/rfc/rfc1034)
+- [RFC 9471: DNS Glue Requirements in Referral Responses](https://www.rfc-editor.org/rfc/rfc9471)
 - [RFC 1035: Domain Names—Implementation and Specification](https://www.rfc-editor.org/rfc/rfc1035)
 - [MITRE ATT&CK T1071.004: DNS](https://attack.mitre.org/techniques/T1071/004/)
 
